@@ -3,6 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <title>Pricing d'options</title>
+<script src="/mpld3/d3.js"></script>
+<script src="/mpld3/mpld3.js"></script>
 <style>
   * { box-sizing: border-box; }
   body { margin: 0; font-family: Segoe UI, Arial, sans-serif; background: #f3f6fb; color: #14223b; }
@@ -64,8 +66,7 @@
   table.t tbody tr.note td { white-space: normal; }
   table.t tbody tr.note td:last-child { text-align: left; }
 
-  .arbre { overflow: auto; border: 1px solid #d9e2f0; border-radius: 8px; }
-  .graphe-large { overflow: auto; }
+  .arbre, .graphe-large { overflow: auto; border: 1px solid #d9e2f0; border-radius: 8px; }
 </style>
 </head>
 <body>
@@ -138,13 +139,6 @@
     </div>
   </div>
 
-  <div class="panneau" id="p-delta">
-    <div class="controles">
-      <div><label>Pas N</label><input id="n-delta" type="number" value="100" min="1" max="2000"></div>
-      <button class="bouton" onclick="calculer('delta')">Calculer</button>
-    </div>
-  </div>
-
   <div id="sortie"></div>
 </main>
 
@@ -187,7 +181,7 @@
     };
   });
 
-  // ---------- volatilité ----------
+  // ---------- volatilité : implicite d'abord, historique sinon ----------
   function afficherVol(sigma, source) {
     poser("sigma", sigma ? sigma : "");
     document.getElementById("lab_sigma").textContent =
@@ -195,7 +189,35 @@
     if (!sigma) message(source);
   }
 
+  let jeton = 0;
+  async function majVol() {
+    if (!val("expiration") || !val("k")) return;
+    const mon = ++jeton;
+    poser("t", maturiteLocale(val("expiration")));
+    const [ok, d] = await appel("vol", { ...base(), vol_hist: volHist });
+    if (mon !== jeton) return;
+    if (!ok) {
+      if (volHist) afficherVol(volHist, "historique");
+      else afficherVol(null, d.erreur);
+      return;
+    }
+    poser("t", d.t);
+    afficherVol(d.sigma, d.source);
+  }
+
+  function debounce(fn, ms) {
+    let h;
+    return (...a) => { clearTimeout(h); h = setTimeout(() => fn(...a), ms); };
+  }
+  const majVolDiffere = debounce(() => majVol(), 400);
+
   // ---------- marché ----------
+  function maturiteLocale(exp) {
+    const auj = new Date(new Date().toDateString());
+    const jours = Math.round((new Date(exp + "T00:00:00") - auj) / 86400000);
+    return +(Math.max(jours, 1) / 365).toFixed(4);
+  }
+
   async function chargerTicker() {
     message("Chargement...", true);
     const [ok, d] = await appel("ticker", { ticker: val("ticker") });
@@ -214,18 +236,6 @@
       d.expirations.map(e => "<option>" + e + "</option>").join("");
     changerEcheance();
   }
-
-  function maturiteLocale(exp) {
-    const auj = new Date(new Date().toDateString());
-    const jours = Math.round((new Date(exp + "T00:00:00") - auj) / 86400000);
-    return +(Math.max(jours, 1) / 365).toFixed(4);
-  }
-
-  function debounce(fn, ms) {
-    let h;
-    return (...a) => { clearTimeout(h); h = setTimeout(() => fn(...a), ms); };
-  }
-  const majVolDiffere = debounce(() => majVol(), 400);
 
   async function changerEcheance() {
     if (!val("expiration")) return;
@@ -250,57 +260,31 @@
     majVol();
   }
 
-  // implicite d'abord ; historique si Newton ne converge pas ou si l'appel échoue
-  let jeton = 0;
-  async function majVol() {
-    if (!val("expiration") || !val("k")) return;
-    const mon = ++jeton;
-    poser("t", maturiteLocale(val("expiration")));
-    const [ok, d] = await appel("vol", { ...base(), vol_hist: volHist });
-    if (mon !== jeton) return;
-    if (!ok) {
-      if (volHist) afficherVol(volHist, "historique");
-      else afficherVol(null, d.erreur);
-      return;
-    }
-    poser("t", d.t);
-    afficherVol(d.sigma, d.source);
-  }
-
-  // ---------- affichage des résultats ----------
-  function carteHtml(c) {
-    return '<div class="cartec ' + (c.ton || "") + '"><div class="lab">' + c.label
-      + '</div><div class="val">' + c.valeur + "</div></div>";
-  }
-
-  function tableauHtml(t) {
-    let h = "<h3>" + t.titre + '</h3><div class="defil"><table class="t"><thead><tr>'
-      + t.entetes.map(e => "<th>" + e + "</th>").join("") + "</tr></thead><tbody>";
-    t.lignes.forEach(l => {
-      h += '<tr class="' + (l.ton || "") + '">' + l.cells.map(c => "<td>" + c + "</td>").join("") + "</tr>";
-    });
-    return h + "</tbody></table></div>";
-  }
-
+  // ---------- affichage des résultats (les graphes matplotlib sont dessinés par mpld3) ----------
   function afficherBlocs(blocs) {
     let html = "";
+    const figures = [];
     blocs.forEach(b => {
       if (b.type === "cartes") {
-        html += "<h3>" + b.titre + '</h3><div class="grille">' + b.cartes.map(carteHtml).join("") + "</div>";
+        html += "<h3>" + b.titre + '</h3><div class="grille">' + b.cartes.map(c =>
+          '<div class="cartec ' + (c.ton || "") + '"><div class="lab">' + c.label
+          + '</div><div class="val">' + c.valeur + "</div></div>").join("") + "</div>";
       } else if (b.type === "tableau") {
-        html += tableauHtml(b);
-      } else if (b.type === "arbre") {
-        html += "<h3>" + b.titre + '</h3><div class="arbre">' + dessiner(b.niveaux, b.dates, b.crr) + "</div>";
-      } else if (b.type === "convergence") {
-        html += "<h3>Prix européen en fonction de N</h3>" + grapheConvergence(b);
-      } else if (b.type === "smile") {
-        html += "<h3>Smile de volatilité implicite · échéance " + b.echeance + "</h3>"
-          + '<div class="graphe-large">' + grapheSmile(b) + "</div>";
+        html += "<h3>" + b.titre + '</h3><div class="defil"><table class="t"><thead><tr>'
+          + b.entetes.map(e => "<th>" + e + "</th>").join("") + "</tr></thead><tbody>"
+          + b.lignes.map(l => '<tr class="' + (l.ton || "") + '">'
+            + l.cells.map(c => "<td>" + c + "</td>").join("") + "</tr>").join("")
+          + "</tbody></table></div>";
+      } else if (b.type === "graphe") {
+        const id = "fig" + figures.length;
+        figures.push([id, b.figure]);
+        html += "<h3>" + b.titre + '</h3><div class="' + b.classe + '" id="' + id + '"></div>';
       } else if (b.type === "info") {
         html += '<p class="info">' + b.texte + "</p>";
       }
     });
     sortie.innerHTML = html;
+    figures.forEach(([id, fig]) => mpld3.draw_figure(id, fig));
   }
 
   async function calculer(route, modele) {
@@ -313,167 +297,12 @@
       extra.model = val("model-cv"); extra.n = +val("n-cv");
       extra.ref_model = val("refmodel-cv"); extra.n_ref = +val("nref-cv");
     }
-    if (route === "delta") extra.n = +val("n-delta");
     if (route === "convergence") extra.n = +val("n-conv");
 
     sortie.innerHTML = "";
     const [ok, d] = await appel(route, { ...base(), ...extra });
     if (!ok) { sortie.innerHTML = '<p class="erreur">' + d.erreur + "</p>"; return; }
     afficherBlocs(d.blocs);
-  }
-
-  // ---------- graphe du smile de volatilité ----------
-  function grapheSmile(b) {
-    const W = 860, H = 380, g = 74, d = 24, h = 24, bas = 62;
-
-    const ks = b.points.map(p => p.strike);
-    const ivs = b.points.map(p => p.iv * 100);
-
-    // le point du strike choisi (K, σ) doit toujours rester dans le graphe
-    const xs = ks.concat([b.k]);
-    const ys = ivs.concat([b.sigma * 100]);
-    const xmin = Math.min(...xs), xmax = Math.max(...xs);
-    const etendue = (xmax - xmin) || 1;
-
-    let ymin = Math.min(...ys), ymax = Math.max(...ys);
-    const marge = (ymax - ymin) * 0.15 || 1;
-    ymin = Math.max(ymin - marge, 0); ymax += marge;
-
-    const X = k => g + (k - xmin) / etendue * (W - g - d);
-    const Y = v => H - bas - (v - ymin) / (ymax - ymin) * (H - h - bas);
-
-    let svg = '<svg width="' + W + '" height="' + H + '" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, Arial, sans-serif" style="border:1px solid #d9e2f0;border-radius:8px">';
-
-    // grille et graduations
-    for (let i = 0; i <= 5; i++) {
-      const v = ymin + (ymax - ymin) * i / 5, y = Y(v);
-      svg += '<line x1="' + g + '" y1="' + y + '" x2="' + (W - d) + '" y2="' + y + '" stroke="#e3eaf5"/>'
-        + '<text x="' + (g - 8) + '" y="' + (y + 4) + '" text-anchor="end" font-size="11" fill="#5b6b86">' + v.toFixed(1) + " %</text>";
-    }
-    for (let i = 0; i <= 6; i++) {
-      const k = xmin + etendue * i / 6;
-      svg += '<text x="' + X(k) + '" y="' + (H - bas + 18) + '" text-anchor="middle" font-size="11" fill="#5b6b86">' + k.toFixed(0) + "</text>";
-    }
-    svg += '<text x="' + ((g + W - d) / 2) + '" y="' + (H - bas + 40) + '" text-anchor="middle" font-size="12" fill="#5b6b86">Strike K</text>'
-      + '<text x="16" y="' + ((h + H - bas) / 2) + '" text-anchor="middle" font-size="12" fill="#5b6b86" transform="rotate(-90 16 ' + ((h + H - bas) / 2) + ')">Volatilité implicite</text>'
-      + '<line x1="' + g + '" y1="' + (H - bas) + '" x2="' + (W - d) + '" y2="' + (H - bas) + '" stroke="#9db3d8"/>'
-      + '<line x1="' + g + '" y1="' + h + '" x2="' + g + '" y2="' + (H - bas) + '" stroke="#9db3d8"/>';
-
-    // courbe du smile
-    const chemin = b.points.map((p, i) => (i ? "L" : "M") + X(p.strike) + "," + Y(p.iv * 100)).join("");
-    svg += '<path d="' + chemin + '" fill="none" stroke="#0b2a5b" stroke-width="2.2"/>';
-    b.points.forEach(p => {
-      svg += '<circle cx="' + X(p.strike) + '" cy="' + Y(p.iv * 100) + '" r="3.5" fill="#0b2a5b">'
-        + "<title>K = " + p.strike + " · vol implicite " + (p.iv * 100).toFixed(2) + " %</title></circle>";
-    });
-
-    // intersection de K et σ : point rouge relié aux deux axes par des pointillés
-    const xk = X(b.k), yk = Y(b.sigma * 100);
-    svg += '<line x1="' + xk + '" y1="' + yk + '" x2="' + xk + '" y2="' + (H - bas) + '" stroke="#c0392b" stroke-width="1.5" stroke-dasharray="4 3"/>'
-      + '<line x1="' + g + '" y1="' + yk + '" x2="' + xk + '" y2="' + yk + '" stroke="#c0392b" stroke-width="1.5" stroke-dasharray="4 3"/>'
-      + '<circle cx="' + xk + '" cy="' + yk + '" r="6.5" fill="#c0392b" stroke="white" stroke-width="2">'
-      + "<title>Strike choisi : K = " + b.k + " · σ = " + (b.sigma * 100).toFixed(2) + " %</title></circle>";
-
-    return svg + "</svg>";
-  }
-
-  // ---------- graphe de convergence ----------
-  function grapheConvergence(b) {
-    const W = 860, H = 400, g = 74, d = 24, h = 24, bas = 54;
-    const tous = b.crr.concat(b.boyle).filter(v => v !== null).concat([b.bs]);
-    let ymin = Math.min(...tous), ymax = Math.max(...tous);
-    const marge = (ymax - ymin) * 0.12 || 0.01;
-    ymin -= marge; ymax += marge;
-    const n0 = b.ns[0], n1 = b.ns[b.ns.length - 1];
-    const X = n => g + (n - n0) / (n1 - n0) * (W - g - d);
-    const Y = v => H - bas - (v - ymin) / (ymax - ymin) * (H - h - bas);
-    const dec = (ymax - ymin) < 0.1 ? 4 : (ymax - ymin) < 1 ? 3 : 2;
-
-    let svg = '<svg width="' + W + '" height="' + H + '" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, Arial, sans-serif" style="border:1px solid #d9e2f0;border-radius:8px">';
-
-    // grille et graduations
-    for (let i = 0; i <= 5; i++) {
-      const v = ymin + (ymax - ymin) * i / 5, y = Y(v);
-      svg += '<line x1="' + g + '" y1="' + y + '" x2="' + (W - d) + '" y2="' + y + '" stroke="#e3eaf5"/>'
-        + '<text x="' + (g - 8) + '" y="' + (y + 4) + '" text-anchor="end" font-size="11" fill="#5b6b86">' + v.toFixed(dec) + "</text>";
-    }
-    for (let i = 0; i <= 6; i++) {
-      const n = Math.round(n0 + (n1 - n0) * i / 6);
-      svg += '<text x="' + X(n) + '" y="' + (H - bas + 18) + '" text-anchor="middle" font-size="11" fill="#5b6b86">' + n + "</text>";
-    }
-    svg += '<text x="' + ((g + W - d) / 2) + '" y="' + (H - 10) + '" text-anchor="middle" font-size="12" fill="#5b6b86">N (nombre de pas)</text>'
-      + '<line x1="' + g + '" y1="' + (H - bas) + '" x2="' + (W - d) + '" y2="' + (H - bas) + '" stroke="#9db3d8"/>'
-      + '<line x1="' + g + '" y1="' + h + '" x2="' + g + '" y2="' + (H - bas) + '" stroke="#9db3d8"/>';
-
-    // Black-Scholes
-    svg += '<line x1="' + g + '" y1="' + Y(b.bs) + '" x2="' + (W - d) + '" y2="' + Y(b.bs)
-      + '" stroke="#c0392b" stroke-width="2" stroke-dasharray="7 5"/>';
-
-    // courbes (les points manquants interrompent le trait)
-    function courbe(valeurs, couleur) {
-      let chemin = "", ouvert = false;
-      valeurs.forEach((v, i) => {
-        if (v === null) { ouvert = false; return; }
-        chemin += (ouvert ? "L" : "M") + X(b.ns[i]) + "," + Y(v);
-        ouvert = true;
-      });
-      return '<path d="' + chemin + '" fill="none" stroke="' + couleur + '" stroke-width="2"/>';
-    }
-    svg += courbe(b.crr, "#0b2a5b") + courbe(b.boyle, "#e08a00");
-
-    // légende
-    const lx = W - d - 190;
-    [["CRR", "#0b2a5b", ""], ["Boyle", "#e08a00", ""], ["Black-Scholes", "#c0392b", "7 5"]].forEach((e, i) => {
-      const y = h + 14 + i * 20;
-      svg += '<line x1="' + lx + '" y1="' + y + '" x2="' + (lx + 28) + '" y2="' + y + '" stroke="' + e[1]
-        + '" stroke-width="2.5"' + (e[2] ? ' stroke-dasharray="' + e[2] + '"' : "") + "/>"
-        + '<text x="' + (lx + 36) + '" y="' + (y + 4) + '" font-size="12" fill="#14223b">' + e[0] + "</text>";
-    });
-    return svg + "</svg>";
-  }
-
-  // ---------- dessin de l'arbre ----------
-  function dessiner(niveaux, dates, crr) {
-    const P = niveaux.length - 1;
-    const dx = 125, dy = crr ? 50 : 46, l = 90, h = 38, marge = 20, haut = 46;
-    const largeur = P * dx + l + 2 * marge;
-    const contenu = (crr ? P : 2 * P) * dy + h;
-    const hauteur = contenu + haut + marge;
-    const centre = haut + contenu / 2;
-    const X = i => marge + i * dx;
-    const Y = (i, j) => centre + (crr ? (i / 2 - j) : (i - j)) * dy;
-
-    let svg = '<svg width="' + largeur + '" height="' + hauteur + '" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, Arial, sans-serif">';
-
-    niveaux.forEach((_, i) => {
-      svg += '<text x="' + (X(i) + l / 2) + '" y="18" text-anchor="middle" font-size="12" font-weight="700" fill="#0b2a5b">i = ' + i + "</text>"
-        + '<text x="' + (X(i) + l / 2) + '" y="33" text-anchor="middle" font-size="10" fill="#5b6b86">' + dates[i] + "</text>";
-    });
-
-    niveaux.forEach((niveau, i) => {
-      if (i === P) return;
-      niveau.forEach((_, j) => {
-        const enfants = crr ? [j, j + 1] : [j, j + 1, j + 2];
-        enfants.forEach(c => {
-          svg += '<line x1="' + (X(i) + l) + '" y1="' + Y(i, j) + '" x2="' + X(i + 1) + '" y2="' + Y(i + 1, c)
-            + '" stroke="#9db3d8" stroke-width="1.2"/>';
-        });
-      });
-    });
-
-    niveaux.forEach((niveau, i) => {
-      niveau.forEach((n, j) => {
-        const fond = n.ex ? "#0b2a5b" : "none";
-        const texte = n.ex ? "#ffffff" : "#0b2a5b";
-        const x = X(i), y = Y(i, j);
-        svg += '<rect x="' + x + '" y="' + (y - h / 2) + '" width="' + l + '" height="' + h
-          + '" rx="6" fill="' + fond + '" stroke="#0b2a5b" stroke-width="' + (n.ex ? 3 : 1.5) + '"/>'
-          + '<text x="' + (x + l / 2) + '" y="' + (y - 3) + '" text-anchor="middle" font-size="11" fill="' + texte + '">S ' + n.s.toFixed(2) + "</text>"
-          + '<text x="' + (x + l / 2) + '" y="' + (y + 12) + '" text-anchor="middle" font-size="12" font-weight="700" fill="' + texte + '">V ' + n.v.toFixed(2) + "</text>";
-      });
-    });
-
-    return svg + "</svg>";
   }
 </script>
 </body>

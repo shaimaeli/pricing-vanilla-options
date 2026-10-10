@@ -1,8 +1,20 @@
+import io
+import json
 import traceback
 from datetime import date
+
 import numpy as np
 from scipy.stats import norm
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, send_file
+
+import matplotlib
+matplotlib.use("Agg")                      # pas de fenêtre : les figures sont envoyées au navigateur
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.patches import FancyBboxPatch
+import mpld3
+from mpld3 import plugins, urls
+from mpld3._display import NumpyEncoder
 
 from bs import BlackScholes
 from crr import Crr
@@ -12,6 +24,10 @@ from moteur import remonter
 from marche import donnees_ticker, taux_sans_risque, liste_strikes, vol_pour_strike, smile
 
 app = Flask(__name__)
+
+# couleurs de l'interface
+MARINE, GRIS, GRILLE, AXE = "#0b2a5b", "#5b6b86", "#e3eaf5", "#9db3d8"
+ROUGE, ORANGE = "#c0392b", "#e08a00"
 
 
 # ---------- outils ----------
@@ -68,9 +84,131 @@ def ligne(cells, ton=""):
     return {"cells": cells, "ton": ton}
 
 
+# ---------- graphes matplotlib (interactifs avec mpld3) ----------
+
+def bloc_graphe(titre, fig, classe="graphe-large"):
+    figure = json.loads(json.dumps(mpld3.fig_to_dict(fig), cls=NumpyEncoder))
+    return {"type": "graphe", "titre": titre, "figure": figure, "classe": classe}
+
+
+def figure_axes(largeur, hauteur):
+    fig = Figure(figsize=(largeur, hauteur), dpi=100)
+    FigureCanvasAgg(fig)
+    ax = fig.subplots()
+    ax.set_facecolor("none")
+    ax.grid(color=GRILLE)
+    ax.tick_params(colors=GRIS, labelsize=9)
+    for cote in ax.spines.values():
+        cote.set_color(AXE)
+    return fig, ax
+
+
+def graphe_smile(points, k, sigma):
+    fig, ax = figure_axes(8.6, 3.8)
+    ks = [p["strike"] for p in points]
+    ivs = [p["iv"] * 100 for p in points]
+    v0 = sigma * 100
+
+    tous = ivs + [v0]
+    marge = (max(tous) - min(tous)) * 0.15 or 1
+    bas, haut = max(min(tous) - marge, 0), max(tous) + marge
+    gauche = min(ks + [k])
+
+    # courbe du smile + info-bulle au survol
+    ax.plot(ks, ivs, color=MARINE, lw=2.2)
+    pts = ax.plot(ks, ivs, "o", color=MARINE, ms=5)[0]
+    plugins.connect(fig, plugins.PointLabelTooltip(
+        pts, labels=[f"K = {x:g} · vol implicite {y:.2f} %" for x, y in zip(ks, ivs)]))
+
+    # intersection de K et σ : point rouge relié aux deux axes
+    ax.plot([k, k], [bas, v0], color=ROUGE, lw=1.5, ls="--")
+    ax.plot([gauche, k], [v0, v0], color=ROUGE, lw=1.5, ls="--")
+    rouge = ax.plot([k], [v0], "o", color=ROUGE, ms=11, mec="white", mew=2)[0]
+    plugins.connect(fig, plugins.PointLabelTooltip(
+        rouge, labels=[f"Strike choisi : K = {k:g} · σ = {v0:.2f} %"]))
+
+    ax.set_ylim(bas, haut)
+    ax.set_xlabel("Strike K", color=GRIS)
+    ax.set_ylabel("Volatilité implicite (%)", color=GRIS)
+    return fig
+
+
+def graphe_convergence(ns, crr, boyle, bs):
+    fig, ax = figure_axes(8.6, 4.0)
+    for valeurs, couleur, nom in ((crr, MARINE, "CRR"), (boyle, ORANGE, "Boyle")):
+        xs = [n for n, v in zip(ns, valeurs) if v is not None]
+        ys = [v for v in valeurs if v is not None]
+        ax.plot(xs, ys, color=couleur, lw=2, label=nom)
+    ax.plot([ns[0], ns[-1]], [bs, bs], color=ROUGE, lw=2, ls="--", label="Black-Scholes")
+    ax.set_xlabel("N (nombre de pas)", color=GRIS)
+    ax.legend(loc="upper right")
+    return fig
+
+
+def graphe_arbre(niveaux, dates, crr):
+    # les coordonnées sont en pouces : 1 pouce = 100 pixels
+    P = len(niveaux) - 1
+    dx, dy, l, h, marge, haut = 1.25, (0.5 if crr else 0.46), 0.9, 0.38, 0.2, 0.46
+    largeur = P * dx + l + 2 * marge
+    contenu = (P if crr else 2 * P) * dy + h
+    hauteur = contenu + haut + marge
+    centre = marge + contenu / 2
+
+    fig = Figure(figsize=(largeur, hauteur), dpi=100)
+    FigureCanvasAgg(fig)
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.set_xlim(0, largeur)
+    ax.set_ylim(0, hauteur)
+    ax.axis("off")
+    ax.set_facecolor("none")
+
+    def X(i):
+        return marge + i * dx
+
+    def Y(i, j):
+        return centre - ((i / 2 - j) if crr else (i - j)) * dy
+
+    # en-têtes des niveaux
+    for i in range(P + 1):
+        ax.text(X(i) + l / 2, hauteur - 0.18, f"i = {i}", ha="center", va="center", color=MARINE, fontsize=9)
+        ax.text(X(i) + l / 2, hauteur - 0.33, dates[i], ha="center", va="center", color=GRIS, fontsize=7)
+
+    # traits entre un nœud et ses enfants
+    for i in range(P):
+        for j in range(len(niveaux[i])):
+            for c in ((j, j + 1) if crr else (j, j + 1, j + 2)):
+                ax.plot([X(i) + l, X(i + 1)], [Y(i, j), Y(i + 1, c)], color=AXE, lw=1.2)
+
+    # nœuds (plein bleu marine = exercice anticipé)
+    for i, niveau in enumerate(niveaux):
+        for j, nd in enumerate(niveau):
+            x, y = X(i), Y(i, j)
+            plein = nd["ex"]
+            ax.add_patch(FancyBboxPatch((x, y - h / 2), l, h, boxstyle="round,pad=0,rounding_size=0.06",
+                                        fc=MARINE if plein else "none", ec=MARINE, lw=3 if plein else 1.5))
+            couleur = "white" if plein else MARINE
+            ax.text(x + l / 2, y + 0.07, f"S {nd['s']:.2f}", ha="center", va="center", color=couleur, fontsize=8)
+            ax.text(x + l / 2, y - 0.08, f"V {nd['v']:.2f}", ha="center", va="center", color=couleur, fontsize=8.5)
+
+    plugins.clear(fig)          # pas de zoom sur l'arbre
+    return fig
+
+
+# ---------- pages et fichiers JS de mpld3 (servis depuis la bibliothèque installée) ----------
+
 @app.route("/")
 def index():
     return render_template("index.html")
+
+
+@app.route("/mpld3/d3.js")
+def js_d3():
+    return send_file(urls.D3_LOCAL, mimetype="text/javascript")
+
+
+@app.route("/mpld3/mpld3.js")
+def js_mpld3():
+    return send_file(urls.MPLD3_LOCAL, mimetype="text/javascript")
 
 
 # ---------- Marché ----------
@@ -130,8 +268,6 @@ def api_bs():
         q = lire_q(d)
         bs = BlackScholes(d["k"], d["s0"], d["t"], d["r"], d["sigma"], q)
         call, put = bs.pricing_bs("call"), bs.pricing_bs("put")
-        droite = d["s0"] * np.exp(-q * d["t"]) - d["k"] * np.exp(-d["r"] * d["t"])
-        ecart = call - put - droite
 
         # smile : si Yahoo échoue, les prix s'affichent quand même
         points, note = [], ""
@@ -147,9 +283,8 @@ def api_bs():
             carte("Put", f(put)),
         ]}]
         if points:
-            # k et sigma servent à placer le point du strike choisi sur le graphe
-            blocs.append({"type": "smile", "points": points, "echeance": d["expiration"],
-                          "k": d["k"], "sigma": d["sigma"]})
+            titre = f"Smile de volatilité implicite · échéance {d['expiration']}"
+            blocs.append(bloc_graphe(titre, graphe_smile(points, d["k"], d["sigma"])))
         else:
             blocs.append({"type": "info", "texte": note})
         return jsonify(blocs=blocs)
@@ -177,10 +312,6 @@ def api_arbre():
             m = Boyle(d["k"], d["s0"], d["r"], d["t"], d["sigma"], aujourdhui, q)
             prix = m.boyle(n, typ, style, p)
         res = m.resultat
-        P = res["P"]
-
-        ref = BlackScholes(d["k"], d["s0"], d["t"], d["r"], d["sigma"], q).pricing_bs(typ)
-        ecart = prix - ref
 
         # prix + paramètres de l'arbre (u, d et probabilités risque-neutre)
         pr = res["params"]
@@ -194,9 +325,9 @@ def api_arbre():
             cartes.append(carte("pm (proba risque-neutre, milieu)", f6(pr["pm"])))
             cartes.append(carte("pd (proba risque-neutre, baisse)", f6(pr["pd"])))
 
+        fig = graphe_arbre(res["niveaux"], res["dates_niveaux"], modele == "crr")
         blocs = [{"type": "cartes", "titre": "Prix et paramètres de l'arbre", "cartes": cartes},
-                 {"type": "arbre", "titre": f"Arbre {nom_modele(modele)}", "niveaux": res["niveaux"],
-                  "dates": res["dates_niveaux"], "crr": modele == "crr"}]
+                 bloc_graphe(f"Arbre {nom_modele(modele)}", fig, "arbre")]
 
         if style == "Am":
             ex = res["exercices"]
@@ -294,13 +425,13 @@ def api_convergence():
             x = dernier(series[modele])
             cartes.append(carte(f"Erreur {nom_modele(modele)} (N = {n_max})",
                                 "—" if x is None else f"{abs(x - bs):.5f}"))
+        fig = graphe_convergence(ns, series["crr"], series["boyle"], bs)
         return jsonify(blocs=[
-            {"type": "convergence", "ns": ns, "crr": series["crr"], "boyle": series["boyle"], "bs": bs},
+            bloc_graphe("Prix européen en fonction de N", fig),
             {"type": "cartes", "titre": "Erreur vs Black-Scholes", "cartes": cartes},
         ])
     except Exception as e:
         return erreur(e)
-
 
 
 if __name__ == "__main__":
