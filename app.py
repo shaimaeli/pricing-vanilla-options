@@ -18,7 +18,6 @@ from bs import BlackScholes
 from crr import Crr
 from boyle import Boyle
 from cv import Cv
-from moteur import remonter
 from marche import donnees_ticker, taux_sans_risque, liste_strikes, vol_pour_strike, smile
 
 app = Flask(__name__)
@@ -377,8 +376,12 @@ def api_convergence():
 
     def prix_europeen(modele, n):
         try:
-            return remonter(modele, d["k"], d["s0"], d["r"], d["t"], d["sigma"], q, n, typ, "Eu")["prix"]
-        except ValueError:       
+            if modele == "crr":
+                arbre = Crr(d["k"], d["s0"], d["r"], d["t"], d["sigma"], None, q)
+                return arbre.binomial_crr(n, typ, "Eu")
+            arbre = Boyle(d["k"], d["s0"], d["r"], d["t"], d["sigma"], None, q)
+            return arbre.boyle(n, typ, "Eu")
+        except ValueError:       # N trop petit : probabilités impossibles
             return None
 
     ns = list(range(5, n_max + 1))
