@@ -66,7 +66,8 @@
   table.t tbody tr.note td { white-space: normal; }
   table.t tbody tr.note td:last-child { text-align: left; }
 
-  .arbre, .graphe-large { overflow: auto; border: 1px solid #d9e2f0; border-radius: 8px; }
+  /* graphes : fond vide, sans cadre */
+  .arbre, .graphe-large { overflow: auto; }
 </style>
 </head>
 <body>
@@ -147,7 +148,7 @@
   const poser = (id, v) => document.getElementById(id).value = v;
   const sortie = document.getElementById("sortie");
   const info = document.getElementById("info");
-  let volHist = null;   // volatilité historique du ticker chargé
+  let volHist = null;   
 
   async function appel(route, donnees) {
     const rep = await fetch("/api/" + route, {
@@ -171,7 +172,6 @@
     info.className = ok ? "ok" : "";
   }
 
-  // ---------- onglets ----------
   document.querySelectorAll("nav button").forEach(b => {
     b.onclick = () => {
       document.querySelectorAll("nav button, .panneau").forEach(e => e.classList.remove("actif"));
@@ -181,7 +181,6 @@
     };
   });
 
-  // ---------- volatilité : implicite d'abord, historique sinon ----------
   function afficherVol(sigma, source) {
     poser("sigma", sigma ? sigma : "");
     document.getElementById("lab_sigma").textContent =
@@ -211,7 +210,6 @@
   }
   const majVolDiffere = debounce(() => majVol(), 400);
 
-  // ---------- marché ----------
   function maturiteLocale(exp) {
     const auj = new Date(new Date().toDateString());
     const jours = Math.round((new Date(exp + "T00:00:00") - auj) / 86400000);
@@ -252,7 +250,6 @@
     document.getElementById("liste_strikes").innerHTML =
       d.strikes.map(s => "<option value='" + s + "'>").join("");
 
-    // on garde K s'il existe pour cette échéance, sinon le strike le plus proche du spot
     const s0 = +val("s0"), actuel = +val("k");
     const existe = d.strikes.some(s => Math.abs(s - actuel) < 1e-6);
     const proche = d.strikes.reduce((a, b) => Math.abs(b - s0) < Math.abs(a - s0) ? b : a);
@@ -260,7 +257,6 @@
     majVol();
   }
 
-  // ---------- affichage des résultats (les graphes matplotlib sont dessinés par mpld3) ----------
   function afficherBlocs(blocs) {
     let html = "";
     const figures = [];

@@ -1,14 +1,12 @@
-import io
 import json
 import traceback
 from datetime import date
 
-import numpy as np
-from scipy.stats import norm
 from flask import Flask, render_template, request, jsonify, send_file
+from werkzeug.exceptions import HTTPException
 
 import matplotlib
-matplotlib.use("Agg")                      # pas de fenêtre : les figures sont envoyées au navigateur
+matplotlib.use("Agg")
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.patches import FancyBboxPatch
@@ -25,78 +23,71 @@ from marche import donnees_ticker, taux_sans_risque, liste_strikes, vol_pour_str
 
 app = Flask(__name__)
 
-# couleurs de l'interface
-MARINE, GRIS, GRILLE, AXE = "#0b2a5b", "#5b6b86", "#e3eaf5", "#9db3d8"
-ROUGE, ORANGE = "#c0392b", "#e08a00"
+MARINE = "#0b2a5b"
+GRIS = "#5b6b86"
+AXE = "#9db3d8"
+ROUGE = "#c0392b"
+ORANGE = "#e08a00"
 
 
-# ---------- outils ----------
-
-def erreur(e):
+@app.errorhandler(Exception)
+def gerer_erreur(e):
+    if isinstance(e, HTTPException):
+        return e
     if not isinstance(e, ValueError):
         traceback.print_exc()
     return jsonify(erreur=str(e)), 400
 
-
-def f(x):
-    return f"{x:.4f}"
-
-
-def f6(x):
-    return f"{x:.6f}"
 
 
 def carte(label, valeur, ton=""):
     return {"label": label, "valeur": valeur, "ton": ton}
 
 
-def lire_q(d):
-    q = d.get("q")
-    q = 0.0 if q in (None, "") else float(q)
-    if q < 0 or q >= 1:
-        raise ValueError("q doit être entre 0 et 1")
-    return q
-
-
-def verifier_params(d):
-    for cle in ("s0", "k", "t", "sigma"):
-        if not d.get(cle) or d[cle] <= 0:
-            raise ValueError("Charge un ticker, choisis l'échéance et le strike.")
-    lire_q(d)
-
-
-def entier(d, cle, mini, maxi, nom):
-    n = int(d[cle])
-    if n < mini or n > maxi:
-        raise ValueError(f"{nom} doit être compris entre {mini} et {maxi}")
-    return n
-
-
-def nom_modele(m):
-    return "CRR" if m == "crr" else "Boyle"
+def ligne(cells, ton=""):
+    return {"cells": cells, "ton": ton}
 
 
 def tableau(titre, entetes, lignes):
     return {"type": "tableau", "titre": titre, "entetes": entetes, "lignes": lignes}
 
 
-def ligne(cells, ton=""):
-    return {"cells": cells, "ton": ton}
+def verifier(d):
+    """Vérifie les paramètres et renvoie q."""
+    for cle in ["s0", "k", "t", "sigma"]:
+        if not d.get(cle) or d[cle] <= 0:
+            raise ValueError("Charge un ticker, choisis l'échéance et le strike.")
+    q = d.get("q") or 0
+    if q < 0 or q >= 1:
+        raise ValueError("q doit être entre 0 et 1")
+    return q
 
 
-# ---------- graphes matplotlib (interactifs avec mpld3) ----------
+def lire_entier(d, cle, mini, maxi, nom):
+    n = int(d[cle])
+    if n < mini or n > maxi:
+        raise ValueError(f"{nom} doit être compris entre {mini} et {maxi}")
+    return n
+
+
+def nom_modele(modele):
+    if modele == "crr":
+        return "CRR"
+    return "Boyle"
+
+
 
 def bloc_graphe(titre, fig, classe="graphe-large"):
     figure = json.loads(json.dumps(mpld3.fig_to_dict(fig), cls=NumpyEncoder))
     return {"type": "graphe", "titre": titre, "figure": figure, "classe": classe}
 
 
-def figure_axes(largeur, hauteur):
+def nouvelle_figure(largeur, hauteur):
     fig = Figure(figsize=(largeur, hauteur), dpi=100)
     FigureCanvasAgg(fig)
     ax = fig.subplots()
     ax.set_facecolor("none")
-    ax.grid(color=GRILLE)
+    ax.grid(False)
     ax.tick_params(colors=GRIS, labelsize=9)
     for cote in ax.spines.values():
         cote.set_color(AXE)
@@ -104,28 +95,26 @@ def figure_axes(largeur, hauteur):
 
 
 def graphe_smile(points, k, sigma):
-    fig, ax = figure_axes(8.6, 3.8)
-    ks = [p["strike"] for p in points]
-    ivs = [p["iv"] * 100 for p in points]
-    v0 = sigma * 100
+    fig, ax = nouvelle_figure(8.6, 3.8)
+    strikes = [p["strike"] for p in points]
+    vols = [p["iv"] * 100 for p in points]
+    vol_choisie = sigma * 100
 
-    tous = ivs + [v0]
-    marge = (max(tous) - min(tous)) * 0.15 or 1
-    bas, haut = max(min(tous) - marge, 0), max(tous) + marge
-    gauche = min(ks + [k])
+    toutes = vols + [vol_choisie]
+    marge = (max(toutes) - min(toutes)) * 0.15 or 1
+    bas = max(min(toutes) - marge, 0)
+    haut = max(toutes) + marge
 
-    # courbe du smile + info-bulle au survol
-    ax.plot(ks, ivs, color=MARINE, lw=2.2)
-    pts = ax.plot(ks, ivs, "o", color=MARINE, ms=5)[0]
-    plugins.connect(fig, plugins.PointLabelTooltip(
-        pts, labels=[f"K = {x:g} · vol implicite {y:.2f} %" for x, y in zip(ks, ivs)]))
+    ax.plot(strikes, vols, color=MARINE, lw=2.2)
+    points_smile = ax.plot(strikes, vols, "o", color=MARINE, ms=5)[0]
+    textes = [f"K = {x:g} · vol implicite {y:.2f} %" for x, y in zip(strikes, vols)]
+    plugins.connect(fig, plugins.PointLabelTooltip(points_smile, labels=textes))
 
-    # intersection de K et σ : point rouge relié aux deux axes
-    ax.plot([k, k], [bas, v0], color=ROUGE, lw=1.5, ls="--")
-    ax.plot([gauche, k], [v0, v0], color=ROUGE, lw=1.5, ls="--")
-    rouge = ax.plot([k], [v0], "o", color=ROUGE, ms=11, mec="white", mew=2)[0]
-    plugins.connect(fig, plugins.PointLabelTooltip(
-        rouge, labels=[f"Strike choisi : K = {k:g} · σ = {v0:.2f} %"]))
+    ax.plot([k, k], [bas, vol_choisie], color=ROUGE, lw=1.5, ls="--")
+    ax.plot([min(strikes + [k]), k], [vol_choisie, vol_choisie], color=ROUGE, lw=1.5, ls="--")
+    point_rouge = ax.plot([k], [vol_choisie], "o", color=ROUGE, ms=11, mec="white", mew=2)[0]
+    texte = f"Strike choisi : K = {k:g} · σ = {vol_choisie:.2f} %"
+    plugins.connect(fig, plugins.PointLabelTooltip(point_rouge, labels=[texte]))
 
     ax.set_ylim(bas, haut)
     ax.set_xlabel("Strike K", color=GRIS)
@@ -133,25 +122,31 @@ def graphe_smile(points, k, sigma):
     return fig
 
 
-def graphe_convergence(ns, crr, boyle, bs):
-    fig, ax = figure_axes(8.6, 4.0)
-    for valeurs, couleur, nom in ((crr, MARINE, "CRR"), (boyle, ORANGE, "Boyle")):
-        xs = [n for n, v in zip(ns, valeurs) if v is not None]
-        ys = [v for v in valeurs if v is not None]
+def graphe_convergence(ns, prix_crr, prix_boyle, prix_bs):
+    fig, ax = nouvelle_figure(8.6, 4.0)
+    for prix, couleur, nom in [(prix_crr, MARINE, "CRR"), (prix_boyle, ORANGE, "Boyle")]:
+        xs = [n for n, p in zip(ns, prix) if p is not None]
+        ys = [p for p in prix if p is not None]
         ax.plot(xs, ys, color=couleur, lw=2, label=nom)
-    ax.plot([ns[0], ns[-1]], [bs, bs], color=ROUGE, lw=2, ls="--", label="Black-Scholes")
+    ax.plot([ns[0], ns[-1]], [prix_bs, prix_bs], color=ROUGE, lw=2, ls="--", label="Black-Scholes")
     ax.set_xlabel("N (nombre de pas)", color=GRIS)
     ax.legend(loc="upper right")
     return fig
 
 
-def graphe_arbre(niveaux, dates, crr):
-    # les coordonnées sont en pouces : 1 pouce = 100 pixels
-    P = len(niveaux) - 1
-    dx, dy, l, h, marge, haut = 1.25, (0.5 if crr else 0.46), 0.9, 0.38, 0.2, 0.46
-    largeur = P * dx + l + 2 * marge
-    contenu = (P if crr else 2 * P) * dy + h
-    hauteur = contenu + haut + marge
+def graphe_arbre(niveaux, dates, est_crr):
+    nb = len(niveaux) - 1                    
+    ecart_x = 1.25                           
+    ecart_y = 0.5 if est_crr else 0.46       
+    larg_noeud, haut_noeud = 0.9, 0.38
+    marge, haut_titre = 0.2, 0.46
+
+    largeur = nb * ecart_x + larg_noeud + 2 * marge
+    if est_crr:
+        contenu = nb * ecart_y + haut_noeud
+    else:
+        contenu = 2 * nb * ecart_y + haut_noeud
+    hauteur = contenu + haut_titre + marge
     centre = marge + contenu / 2
 
     fig = Figure(figsize=(largeur, hauteur), dpi=100)
@@ -162,39 +157,49 @@ def graphe_arbre(niveaux, dates, crr):
     ax.axis("off")
     ax.set_facecolor("none")
 
-    def X(i):
-        return marge + i * dx
+    def x_noeud(i):
+        return marge + i * ecart_x
 
-    def Y(i, j):
-        return centre - ((i / 2 - j) if crr else (i - j)) * dy
+    def y_noeud(i, j):
+        if est_crr:
+            return centre - (i / 2 - j) * ecart_y
+        return centre - (i - j) * ecart_y
 
-    # en-têtes des niveaux
-    for i in range(P + 1):
-        ax.text(X(i) + l / 2, hauteur - 0.18, f"i = {i}", ha="center", va="center", color=MARINE, fontsize=9)
-        ax.text(X(i) + l / 2, hauteur - 0.33, dates[i], ha="center", va="center", color=GRIS, fontsize=7)
+    for i in range(nb + 1):
+        milieu = x_noeud(i) + larg_noeud / 2
+        ax.text(milieu, hauteur - 0.18, f"i = {i}", ha="center", va="center", color=MARINE, fontsize=9)
+        ax.text(milieu, hauteur - 0.33, dates[i], ha="center", va="center", color=GRIS, fontsize=7)
 
-    # traits entre un nœud et ses enfants
-    for i in range(P):
+    for i in range(nb):
         for j in range(len(niveaux[i])):
-            for c in ((j, j + 1) if crr else (j, j + 1, j + 2)):
-                ax.plot([X(i) + l, X(i + 1)], [Y(i, j), Y(i + 1, c)], color=AXE, lw=1.2)
+            if est_crr:
+                enfants = [j, j + 1]
+            else:
+                enfants = [j, j + 1, j + 2]
+            for c in enfants:
+                ax.plot([x_noeud(i) + larg_noeud, x_noeud(i + 1)], [y_noeud(i, j), y_noeud(i + 1, c)],
+                        color=AXE, lw=1.2)
 
-    # nœuds (plein bleu marine = exercice anticipé)
-    for i, niveau in enumerate(niveaux):
-        for j, nd in enumerate(niveau):
-            x, y = X(i), Y(i, j)
-            plein = nd["ex"]
-            ax.add_patch(FancyBboxPatch((x, y - h / 2), l, h, boxstyle="round,pad=0,rounding_size=0.06",
-                                        fc=MARINE if plein else "none", ec=MARINE, lw=3 if plein else 1.5))
-            couleur = "white" if plein else MARINE
-            ax.text(x + l / 2, y + 0.07, f"S {nd['s']:.2f}", ha="center", va="center", color=couleur, fontsize=8)
-            ax.text(x + l / 2, y - 0.08, f"V {nd['v']:.2f}", ha="center", va="center", color=couleur, fontsize=8.5)
+    for i in range(nb + 1):
+        for j in range(len(niveaux[i])):
+            noeud = niveaux[i][j]
+            x, y = x_noeud(i), y_noeud(i, j)
+            exercice = noeud["ex"]
+            forme = FancyBboxPatch((x, y - haut_noeud / 2), larg_noeud, haut_noeud,
+                                   boxstyle="round,pad=0,rounding_size=0.06",
+                                   fc=MARINE if exercice else "none", ec=MARINE,
+                                   lw=3 if exercice else 1.5)
+            ax.add_patch(forme)
+            couleur = "white" if exercice else MARINE
+            ax.text(x + larg_noeud / 2, y + 0.07, f"S {noeud['s']:.2f}", ha="center", va="center",
+                    color=couleur, fontsize=8)
+            ax.text(x + larg_noeud / 2, y - 0.08, f"V {noeud['v']:.2f}", ha="center", va="center",
+                    color=couleur, fontsize=8.5)
 
-    plugins.clear(fig)          # pas de zoom sur l'arbre
+    plugins.clear(fig)
     return fig
 
 
-# ---------- pages et fichiers JS de mpld3 (servis depuis la bibliothèque installée) ----------
 
 @app.route("/")
 def index():
@@ -211,190 +216,153 @@ def js_mpld3():
     return send_file(urls.MPLD3_LOCAL, mimetype="text/javascript")
 
 
-# ---------- Marché ----------
 
 @app.route("/api/ticker", methods=["POST"])
 def api_ticker():
     d = request.get_json()
-    try:
-        ticker = d["ticker"].strip().upper()
-        spot, vol_hist, q, expirations = donnees_ticker(ticker)
-        r = taux_sans_risque()
-        return jsonify(
-            ticker=ticker,
-            spot=round(spot, 2),
-            r=round(r, 4) if r is not None else None,
-            q=round(q, 4),
-            vol_hist=round(vol_hist, 4) if vol_hist is not None else None,
-            expirations=expirations,
-        )
-    except Exception as e:
-        return erreur(e)
+    ticker = d["ticker"].strip().upper()
+    spot, vol_hist, q, expirations = donnees_ticker(ticker)
+    r = taux_sans_risque()
+    if r is not None:
+        r = round(r, 4)
+    if vol_hist is not None:
+        vol_hist = round(vol_hist, 4)
+    return jsonify(ticker=ticker, spot=round(spot, 2), r=r, q=round(q, 4),
+                   vol_hist=vol_hist, expirations=expirations)
 
 
 @app.route("/api/strikes", methods=["POST"])
 def api_strikes():
     d = request.get_json()
-    try:
-        return jsonify(strikes=liste_strikes(d["ticker"], d["expiration"]))
-    except Exception as e:
-        return erreur(e)
+    return jsonify(strikes=liste_strikes(d["ticker"], d["expiration"]))
 
 
 @app.route("/api/vol", methods=["POST"])
 def api_vol():
     d = request.get_json()
-    try:
-        if not d.get("k") or d["k"] <= 0:
-            raise ValueError("Choisis un strike")
-        if d.get("r") is None or d["r"] == "":
-            raise ValueError("Saisis le taux sans risque r")
-        q = lire_q(d)
-        t, prix, sigma, source = vol_pour_strike(
-            d["ticker"], d["expiration"], d["k"], d["s0"], d["r"], d["type"], d.get("vol_hist"), q
-        )
-        return jsonify(t=round(t, 4), prix=prix, sigma=sigma, source=source)
-    except Exception as e:
-        return erreur(e)
+    if not d.get("k") or d["k"] <= 0:
+        raise ValueError("Choisis un strike")
+    if d.get("r") in (None, ""):
+        raise ValueError("Saisis le taux sans risque r")
+    q = d.get("q") or 0
+    t, prix, sigma, source = vol_pour_strike(d["ticker"], d["expiration"], d["k"], d["s0"],
+                                             d["r"], d["type"], d.get("vol_hist"), q)
+    return jsonify(t=round(t, 4), prix=prix, sigma=sigma, source=source)
 
 
-# ---------- Black-Scholes ----------
 
 @app.route("/api/bs", methods=["POST"])
 def api_bs():
     d = request.get_json()
+    q = verifier(d)
+    bs = BlackScholes(d["k"], d["s0"], d["t"], d["r"], d["sigma"], q)
+    call = bs.pricing_bs("call")
+    put = bs.pricing_bs("put")
+    blocs = [{"type": "cartes", "titre": "Prix",
+              "cartes": [carte("Call", f"{call:.4f}"), carte("Put", f"{put:.4f}")]}]
+
     try:
-        verifier_params(d)
-        q = lire_q(d)
-        bs = BlackScholes(d["k"], d["s0"], d["t"], d["r"], d["sigma"], q)
-        call, put = bs.pricing_bs("call"), bs.pricing_bs("put")
-
-        # smile : si Yahoo échoue, les prix s'affichent quand même
-        points, note = [], ""
-        try:
-            points = smile(d["ticker"], d["expiration"], d["s0"], d["r"], q)
-            if not points:
-                note = "Aucune volatilité implicite exploitable pour cette échéance."
-        except Exception as e:
-            note = f"Smile indisponible : {e}"
-
-        blocs = [{"type": "cartes", "titre": "Prix", "cartes": [
-            carte("Call", f(call)),
-            carte("Put", f(put)),
-        ]}]
-        if points:
-            titre = f"Smile de volatilité implicite · échéance {d['expiration']}"
-            blocs.append(bloc_graphe(titre, graphe_smile(points, d["k"], d["sigma"])))
-        else:
-            blocs.append({"type": "info", "texte": note})
-        return jsonify(blocs=blocs)
+        points = smile(d["ticker"], d["expiration"], d["s0"], d["r"], q)
+        message = "Aucune volatilité implicite exploitable pour cette échéance."
     except Exception as e:
-        return erreur(e)
+        points = []
+        message = f"Smile indisponible : {e}"
+
+    if points:
+        titre = f"Smile de volatilité implicite · échéance {d['expiration']}"
+        blocs.append(bloc_graphe(titre, graphe_smile(points, d["k"], d["sigma"])))
+    else:
+        blocs.append({"type": "info", "texte": message})
+    return jsonify(blocs=blocs)
 
 
-# ---------- CRR et Boyle ----------
 
 @app.route("/api/arbre", methods=["POST"])
 def api_arbre():
     d = request.get_json()
-    try:
-        verifier_params(d)
-        q = lire_q(d)
-        n = entier(d, "n", 1, 2000, "N")
-        p = entier(d, "n_arbre", 1, 10, "Le nombre de périodes affichées")
-        modele, style, typ = d["model"], d["style"], d["type"]
-        aujourdhui = date.today().isoformat()
+    q = verifier(d)
+    n = lire_entier(d, "n", 1, 2000, "N")
+    nb_affiche = lire_entier(d, "n_arbre", 1, 10, "Le nombre de périodes affichées")
+    modele, style, typ = d["model"], d["style"], d["type"]
+    aujourdhui = date.today().isoformat()
 
-        if modele == "crr":
-            m = Crr(d["k"], d["s0"], d["r"], d["t"], d["sigma"], aujourdhui, q)
-            prix = m.binomial_crr(n, typ, style, p)
+    if modele == "crr":
+        arbre = Crr(d["k"], d["s0"], d["r"], d["t"], d["sigma"], aujourdhui, q)
+        prix = arbre.binomial_crr(n, typ, style, nb_affiche)
+    else:
+        arbre = Boyle(d["k"], d["s0"], d["r"], d["t"], d["sigma"], aujourdhui, q)
+        prix = arbre.boyle(n, typ, style, nb_affiche)
+    res = arbre.resultat
+
+    p = res["params"]
+    cartes = [carte("Prix " + nom_modele(modele), f"{prix:.4f}"),
+              carte("u (hausse)", f"{p['u']:.6f}"),
+              carte("d (baisse)", f"{p['d']:.6f}")]
+    if modele == "crr":
+        cartes.append(carte("p (proba risque-neutre)", f"{p['p']:.6f}"))
+    else:
+        cartes.append(carte("pu (proba risque-neutre, hausse)", f"{p['pu']:.6f}"))
+        cartes.append(carte("pm (proba risque-neutre, milieu)", f"{p['pm']:.6f}"))
+        cartes.append(carte("pd (proba risque-neutre, baisse)", f"{p['pd']:.6f}"))
+
+    fig = graphe_arbre(res["niveaux"], res["dates_niveaux"], modele == "crr")
+    blocs = [{"type": "cartes", "titre": "Prix et paramètres de l'arbre", "cartes": cartes},
+             bloc_graphe("Arbre " + nom_modele(modele), fig, "arbre")]
+
+    if style == "Am":
+        exercices = res["exercices"]
+        if len(exercices) == 0:
+            blocs.append({"type": "cartes", "titre": "Exercice anticipé",
+                          "cartes": [carte("Dates d'exercice", "Aucune")]})
         else:
-            m = Boyle(d["k"], d["s0"], d["r"], d["t"], d["sigma"], aujourdhui, q)
-            prix = m.boyle(n, typ, style, p)
-        res = m.resultat
+            lignes = []
+            for g in exercices:
+                if g["pas_debut"] == g["pas_fin"]:
+                    pas = str(g["pas_debut"])
+                else:
+                    pas = f"{g['pas_debut']} – {g['pas_fin']}"
+                lignes.append(ligne([g["date"], pas, f"{g['valeur']:.4f}"]))
+            blocs.append(tableau("Exercice anticipé", ["Date", "Pas", "Valeur d'exercice"], lignes))
+    return jsonify(blocs=blocs)
 
-        # prix + paramètres de l'arbre (u, d et probabilités risque-neutre)
-        pr = res["params"]
-        cartes = [carte(f"Prix {nom_modele(modele)}", f(prix)),
-                  carte("u (hausse)", f6(pr["u"])),
-                  carte("d (baisse)", f6(pr["d"]))]
-        if modele == "crr":
-            cartes.append(carte("p (proba risque-neutre)", f6(pr["p"])))
-        else:
-            cartes.append(carte("pu (proba risque-neutre, hausse)", f6(pr["pu"])))
-            cartes.append(carte("pm (proba risque-neutre, milieu)", f6(pr["pm"])))
-            cartes.append(carte("pd (proba risque-neutre, baisse)", f6(pr["pd"])))
-
-        fig = graphe_arbre(res["niveaux"], res["dates_niveaux"], modele == "crr")
-        blocs = [{"type": "cartes", "titre": "Prix et paramètres de l'arbre", "cartes": cartes},
-                 bloc_graphe(f"Arbre {nom_modele(modele)}", fig, "arbre")]
-
-        if style == "Am":
-            ex = res["exercices"]
-            if not ex:
-                blocs.append({"type": "cartes", "titre": "Exercice anticipé",
-                              "cartes": [carte("Dates d'exercice", "Aucune")]})
-            else:
-                lignes = []
-                for g in ex:
-                    cond = f"S ≥ {g['front']:.2f}" if typ == "call" else f"S ≤ {g['front']:.2f}"
-                    pas = str(g["pas_debut"]) if g["pas_debut"] == g["pas_fin"] else f"{g['pas_debut']} – {g['pas_fin']}"
-                    lignes.append(ligne([g["date"], pas, str(g["nb"]), cond, f(g["valeur"])]))
-                blocs.append(tableau("Exercice anticipé",
-                                     ["Date", "Pas", "Nœuds", "Frontière", "Valeur d'exercice"], lignes))
-        return jsonify(blocs=blocs)
-    except Exception as e:
-        return erreur(e)
-
-
-# ---------- Variable de contrôle ----------
-
-# en dessous de ce seuil (en prix), on considère l'erreur comme quasi nulle
-SEUIL_PARFAIT = 1e-3
 
 
 @app.route("/api/cv", methods=["POST"])
 def api_cv():
     d = request.get_json()
-    try:
-        verifier_params(d)
-        q = lire_q(d)
-        n = entier(d, "n", 1, 2000, "N")
-        n_ref = entier(d, "n_ref", 1, 5000, "N de la référence")
-        modele, ref_modele, typ = d["model"], d["ref_model"], d["type"]
+    q = verifier(d)
+    n = lire_entier(d, "n", 1, 2000, "N")
+    n_ref = lire_entier(d, "n_ref", 1, 5000, "N de la référence")
+    modele, modele_ref, typ = d["model"], d["ref_model"], d["type"]
 
-        c = Cv(d["k"], d["s0"], d["r"], d["t"], d["sigma"], date.today().isoformat(), q)
-        valeur_cv, valeur_am = c.cv(n, modele, typ, ref_modele, n_ref)
-        bs, eu, ref = c.valeur_bs, c.valeur_eu, c.valeur_ref
+    cv = Cv(d["k"], d["s0"], d["r"], d["t"], d["sigma"], date.today().isoformat(), q)
+    prix_cv, prix_am = cv.cv(n, modele, typ, modele_ref, n_ref)
+    prix_bs, prix_eu, prix_ref = cv.valeur_bs, cv.valeur_eu, cv.valeur_ref
 
-        err_am = abs(valeur_am - ref)     # erreur de l'arbre américain brut
-        err_cv = abs(valeur_cv - ref)     # erreur après correction
+    erreur_arbre = abs(prix_am - prix_ref)
+    erreur_cv = abs(prix_cv - prix_ref)
 
-        # conclusion courte
-        if err_cv < SEUIL_PARFAIT and err_am < SEUIL_PARFAIT:
-            texte, ton = f"Arbre déjà exact : erreur {f(err_am)}", "ok"
-        elif err_cv < SEUIL_PARFAIT:
-            texte, ton = f"Amélioration parfaite : erreur passe de {f(err_am)} à {f(err_cv)}", "ok"
-        elif err_cv < err_am:
-            texte, ton = f"Amélioration partielle : erreur passe de {f(err_am)} à {f(err_cv)}", "hl"
-        else:
-            texte, ton = f"Pas d'amélioration : erreur passe de {f(err_am)} à {f(err_cv)}", "bad"
+    if erreur_cv < 0.001 and erreur_arbre < 0.001:
+        conclusion = f"Arbre déjà exact : erreur {erreur_arbre:.4f}"
+    elif erreur_cv < 0.001:
+        conclusion = f"Amélioration parfaite : erreur passe de {erreur_arbre:.4f} à {erreur_cv:.4f}"
+    elif erreur_cv < erreur_arbre:
+        conclusion = f"Amélioration partielle : erreur passe de {erreur_arbre:.4f} à {erreur_cv:.4f}"
+    else:
+        conclusion = f"Pas d'amélioration : erreur passe de {erreur_arbre:.4f} à {erreur_cv:.4f}"
 
-        nom, nom_ref = nom_modele(modele), nom_modele(ref_modele)
-        lignes = [
-            ligne(["Black-Scholes (européen)", f(bs)]),
-            ligne([f"Arbre {nom} européen (N = {n})", f(eu)]),
-            ligne([f"Arbre {nom} américain (N = {n})", f(valeur_am)]),
-            ligne(["Américain corrigé (CV)", f(valeur_cv)], "hl"),
-            ligne([f"Référence {nom_ref} américain (N = {n_ref})", f(ref)]),
-            ligne(["|Américain corrigé − Vréf|", f(err_cv)], ton),
-            ligne(["|Américain arbre − Vréf|", f(err_am)]),
-            ligne(["Conclusion", texte], ton + " note"),
-        ]
-        t_res = tableau(f"Control Variate · {nom} · N = {n}", ["", "Valeur"], lignes)
-        return jsonify(blocs=[t_res])
-    except Exception as e:
-        return erreur(e)
+    nom, nom_ref = nom_modele(modele), nom_modele(modele_ref)
+    lignes = [
+        ligne(["Black-Scholes (européen)", f"{prix_bs:.4f}"]),
+        ligne([f"Arbre {nom} européen (N = {n})", f"{prix_eu:.4f}"]),
+        ligne([f"Arbre {nom} américain (N = {n})", f"{prix_am:.4f}"]),
+        ligne(["Américain corrigé (CV)", f"{prix_cv:.4f}"]),
+        ligne([f"Référence {nom_ref} américain (N = {n_ref})", f"{prix_ref:.4f}"]),
+        ligne(["|Américain corrigé − Vréf|", f"{erreur_cv:.4f}"]),
+        ligne(["|Américain arbre − Vréf|", f"{erreur_arbre:.4f}"]),
+        ligne(["Conclusion", conclusion], "hl note"),      # seule ligne en bleu
+    ]
+    return jsonify(blocs=[tableau("Control Variate Analyse", ["", "Valeur"], lignes)])
 
 
 # ---------- Convergence ----------
@@ -402,36 +370,33 @@ def api_cv():
 @app.route("/api/convergence", methods=["POST"])
 def api_convergence():
     d = request.get_json()
-    try:
-        verifier_params(d)
-        q = lire_q(d)
-        n_max = entier(d, "n", 10, 300, "N max")
-        typ = d["type"]
-        bs = BlackScholes(d["k"], d["s0"], d["t"], d["r"], d["sigma"], q).pricing_bs(typ)
+    q = verifier(d)
+    n_max = lire_entier(d, "n", 10, 300, "N max")
+    typ = d["type"]
+    prix_bs = BlackScholes(d["k"], d["s0"], d["t"], d["r"], d["sigma"], q).pricing_bs(typ)
 
-        ns = list(range(5, n_max + 1))
-        series = {"crr": [], "boyle": []}
-        for n in ns:
-            for modele in series:
-                try:
-                    series[modele].append(remonter(modele, d["k"], d["s0"], d["r"], d["t"], d["sigma"],
-                                                   q, n, typ, "Eu")["prix"])
-                except ValueError:
-                    series[modele].append(None)
+    def prix_europeen(modele, n):
+        try:
+            return remonter(modele, d["k"], d["s0"], d["r"], d["t"], d["sigma"], q, n, typ, "Eu")["prix"]
+        except ValueError:       
+            return None
 
-        dernier = lambda v: next((x for x in reversed(v) if x is not None), None)
-        cartes = []
-        for modele in ("crr", "boyle"):
-            x = dernier(series[modele])
-            cartes.append(carte(f"Erreur {nom_modele(modele)} (N = {n_max})",
-                                "—" if x is None else f"{abs(x - bs):.5f}"))
-        fig = graphe_convergence(ns, series["crr"], series["boyle"], bs)
-        return jsonify(blocs=[
-            bloc_graphe("Prix européen en fonction de N", fig),
-            {"type": "cartes", "titre": "Erreur vs Black-Scholes", "cartes": cartes},
-        ])
-    except Exception as e:
-        return erreur(e)
+    ns = list(range(5, n_max + 1))
+    prix_crr = [prix_europeen("crr", n) for n in ns]
+    prix_boyle = [prix_europeen("boyle", n) for n in ns]
+
+    cartes = []
+    for nom, prix in [("CRR", prix_crr), ("Boyle", prix_boyle)]:
+        valeurs = [p for p in prix if p is not None]
+        if valeurs:
+            erreur = f"{abs(valeurs[-1] - prix_bs):.5f}"
+        else:
+            erreur = "—"
+        cartes.append(carte(f"Erreur {nom} (N = {n_max})", erreur))
+
+    fig = graphe_convergence(ns, prix_crr, prix_boyle, prix_bs)
+    return jsonify(blocs=[bloc_graphe("Prix européen en fonction de N", fig),
+                          {"type": "cartes", "titre": "Erreur vs Black-Scholes", "cartes": cartes}])
 
 
 if __name__ == "__main__":
