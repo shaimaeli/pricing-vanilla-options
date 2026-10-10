@@ -1,4 +1,4 @@
-import numpy as np
+import math
 from datetime import datetime, timedelta
 
 
@@ -15,87 +15,80 @@ class Crr:
         else:
             self.date_initiale = datetime.today()
         self.resultat = None
-        self.exercices = []
 
-    def payoff(self, S, type_option):
+    def payoff(self, s, type_option):
         if type_option == 'call':
-            return np.maximum(S - self.k, 0)
-        return np.maximum(self.k - S, 0)
+            return max(s - self.k, 0)
+        return max(self.k - s, 0)
 
     def date_du_pas(self, i, dt):
-        jours = int(round(i * dt * 365))
-        return (self.date_initiale + timedelta(days=jours)).strftime("%Y-%m-%d")
+        jours = round(i * dt * 365)
+        date = self.date_initiale + timedelta(days=jours)
+        return date.strftime("%Y-%m-%d")
 
     def binomial_crr(self, N, type_option='call', option_style='Eu', n_affiche=0):
-        if N < 1:
-            raise ValueError("N doit être au moins 1")
-        n_affiche = min(max(int(n_affiche), 0), N)
-
-        # paramètres de l'arbre
         dt = self.t / N
-        u = np.exp(self.sigma * np.sqrt(dt))
+        u = math.exp(self.sigma * math.sqrt(dt))
         d = 1 / u
-        p = (np.exp((self.r - self.q) * dt) - d) / (u - d)
-        actu = np.exp(-self.r * dt)
+        p = (math.exp((self.r - self.q) * dt) - d) / (u - d)
+        actu = math.exp(-self.r * dt)
         if p < 0 or p > 1:
-            raise ValueError("CRR : la probabilité p n'est pas dans [0, 1]. Augmente N.")
+            raise ValueError("CRR : p n'est pas entre 0 et 1, augmente N")
+        n_affiche = min(n_affiche, N)
 
-        # niveau N : prix du sous-jacent et payoff à l'échéance
-        # au niveau i, le nœud j vaut S0 * u^(2j - i)
-        S = self.s0 * u ** (2 * np.arange(N + 1) - N)
-        V = self.payoff(S, type_option)
-
-        gardes = {}                       # niveaux qu'on veut afficher
+        # valeurs à l'échéance
+        V = []
+        niveaux = [None] * (n_affiche + 1)
         if n_affiche == N:
-            gardes[N] = (S, V, np.zeros(N + 1, dtype=bool))
+            niveaux[N] = []
+        for j in range(N + 1):
+            s = self.s0 * u ** (2 * j - N)
+            V.append(self.payoff(s, type_option))
+            if n_affiche == N:
+                niveaux[N].append({"s": round(s, 6), "v": round(V[j], 6), "ex": False})
 
-        liste_exercices = []              # (pas, plus petite valeur d'exercice)
-
-        # remontée de l'arbre
-        for i in range(N - 1, -1, -1):
-            S = self.s0 * u ** (2 * np.arange(i + 1) - i)
-            continuation = actu * (p * V[1:] + (1 - p) * V[:-1])
-
-            if option_style == 'Am':
-                exercice = self.payoff(S, type_option)
-                en_exercice = exercice > continuation + 1e-12
-                V = np.where(en_exercice, exercice, continuation)
-                if en_exercice.any():
-                    liste_exercices.append((i, float(exercice[en_exercice].min())))
-            else:
-                en_exercice = np.zeros(i + 1, dtype=bool)
-                V = continuation
-
-            if i <= n_affiche:
-                gardes[i] = (S, V, en_exercice)
-
-        # dates d'exercice anticipé (un pas par ligne, regroupés si même date)
+        # on remonte l'arbre
         exercices = []
-        for i, valeur in reversed(liste_exercices):
-            date = self.date_du_pas(i, dt)
-            if len(exercices) > 0 and exercices[-1]["date"] == date:
-                exercices[-1]["pas_fin"] = i
-                exercices[-1]["valeur"] = min(exercices[-1]["valeur"], valeur)
-            else:
-                exercices.append({"date": date, "pas_debut": i, "pas_fin": i, "valeur": valeur})
-
-        # niveaux à afficher
-        niveaux = []
-        for i in range(n_affiche + 1):
-            S_i, V_i, ex_i = gardes[i]
+        for i in range(N - 1, -1, -1):
+            nouveau_V = []
             niveau = []
-            for j in range(len(S_i)):
-                niveau.append({"s": round(float(S_i[j]), 6),
-                               "v": round(float(V_i[j]), 6),
-                               "ex": bool(ex_i[j])})
-            niveaux.append(niveau)
+            plus_petite_valeur = None
+            for j in range(i + 1):
+                s = self.s0 * u ** (2 * j - i)
+                continuation = actu * (p * V[j + 1] + (1 - p) * V[j])
+                exercice = self.payoff(s, type_option)
+                # petite marge pour ignorer les erreurs d'arrondi
+                if option_style == 'Am' and exercice > continuation + 1e-10:
+                    valeur = exercice
+                    exerce = True
+                    if plus_petite_valeur is None or exercice < plus_petite_valeur:
+                        plus_petite_valeur = exercice
+                else:
+                    valeur = continuation
+                    exerce = False
+                nouveau_V.append(valeur)
+                if i <= n_affiche:
+                    niveau.append({"s": round(s, 6), "v": round(valeur, 6), "ex": exerce})
+            V = nouveau_V
+            if i <= n_affiche:
+                niveaux[i] = niveau
 
-        self.exercices = exercices
+            # exercice anticipé à ce pas (on regroupe les pas qui ont la même date)
+            if plus_petite_valeur is not None:
+                date = self.date_du_pas(i, dt)
+                if len(exercices) > 0 and exercices[-1]["date"] == date:
+                    exercices[-1]["pas_debut"] = i
+                    exercices[-1]["valeur"] = min(exercices[-1]["valeur"], plus_petite_valeur)
+                else:
+                    exercices.append({"date": date, "pas_debut": i, "pas_fin": i,
+                                      "valeur": plus_petite_valeur})
+        exercices.reverse()
+
         self.resultat = {
-            "prix": float(V[0]),
+            "prix": V[0],
             "niveaux": niveaux,
             "dates_niveaux": [self.date_du_pas(i, dt) for i in range(n_affiche + 1)],
             "exercices": exercices,
-            "params": {"u": float(u), "d": float(d), "p": float(p)},
+            "params": {"u": u, "d": d, "p": p},
         }
-        return float(V[0])
+        return V[0]
